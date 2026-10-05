@@ -29,8 +29,7 @@ class SmoothingExperiment:
     def __init__(self, config: ExperimentConfig | None = None):
         self.config = config or ExperimentConfig()
         self.generator = RobustAnchorCleanSignalGenerator(
-            n_anchors=self.config.n_anchors,
-            anchor_half_window=self.config.anchor_half_window,
+            anchor_spacing_seconds=(self.config.reference_anchor_spacing_seconds)
         )
         self.parameter_grid = generate_parameter_grid(self.config)
 
@@ -46,7 +45,17 @@ class SmoothingExperiment:
             for variable, variable_cfg in VARIABLES.items():
                 raw = df[variable_cfg.column].to_numpy(dtype=float)
 
-                clean_result = self.generator.generate(raw)
+                sampling_seconds = float(
+                    df.attrs.get(
+                        "sampling_seconds",
+                        1.0,
+                    )
+                )
+
+                clean_result = self.generator.generate(
+                    raw,
+                    sampling_seconds=sampling_seconds,
+                )
                 quantization_step = df.attrs.get("quantization_steps", {}).get(
                     variable_cfg.column
                 )
@@ -66,6 +75,14 @@ class SmoothingExperiment:
                         "noise_profile": noise_profile,
                         "anchor_indices": clean_result.anchor_indices,
                         "anchor_values": clean_result.anchor_values,
+                        "sampling_seconds": (sampling_seconds),
+                        "reference_spacing_samples": (clean_result.spacing_samples),
+                        "reference_spacing_seconds": (
+                            clean_result.actual_spacing_seconds
+                        ),
+                        "reference_median_window_samples": (
+                            clean_result.median_window_samples
+                        ),
                     }
                 )
 
@@ -97,6 +114,7 @@ class SmoothingExperiment:
                         seed=seed,
                         add_spikes=self.config.add_spikes,
                         apply_quantization=self.config.apply_quantization,
+                        use_correlation=(self.config.use_correlated_noise),
                     )
 
                     for filter_name, combinations in self.parameter_grid.items():
@@ -168,6 +186,7 @@ class SmoothingExperiment:
                         seed=seed,
                         add_spikes=self.config.add_spikes,
                         apply_quantization=self.config.apply_quantization,
+                        use_correlation=(self.config.use_correlated_noise),
                     )
 
                     for _, winner in variable_winners.iterrows():
@@ -178,7 +197,10 @@ class SmoothingExperiment:
                             clean,
                             noisy,
                             filtered,
-                            warmup_samples=self.config.metric_warmup_samples,
+                            warmup_samples=max(
+                                self.config.metric_warmup_samples,
+                                max(self.config.sg_windows),
+                            ),
                         )
 
                         rows.append(
@@ -261,11 +283,24 @@ class SmoothingExperiment:
         )
         tuning_results.to_csv(output_dir / "all_tuning_results.csv", index=False)
 
-        candidate_summary = summarize_candidates(tuning_results)
-        ranked_summary = add_selection_ranks(
-            candidate_summary,
-            self.config,
-        )
+        # ---------------------------------------------------------
+        # FILTER SELECTION USES THE NOMINAL REAL-NOISE CONDITION
+        # ---------------------------------------------------------
+        #
+        # 0.5x and 2.0x remain useful for robustness plots, but they
+        # should not change which parameters are considered optimal
+        # for the estimated real operating condition.
+
+        tuning_selection = tuning_results[
+            np.isclose(
+                tuning_results["noise_level"],
+                self.config.selection_noise_level,
+            )
+        ].copy()
+
+        candidate_summary = summarize_candidates(tuning_selection)
+
+        ranked_summary = add_selection_ranks(candidate_summary)
         ranked_summary.to_csv(output_dir / "candidate_summary.csv", index=False)
 
         # Best hyperparameter set inside EMA, SG, WSG and Kalman separately.
@@ -276,11 +311,16 @@ class SmoothingExperiment:
         validation_results = self._validate_winners(prepared, best_per_filter)
         validation_results.to_csv(output_dir / "validation_results.csv", index=False)
 
-        validation_summary = summarize_candidates(validation_results)
-        validation_ranked = add_selection_ranks(
-            validation_summary,
-            self.config,
-        )
+        validation_selection = validation_results[
+            np.isclose(
+                validation_results["noise_level"],
+                self.config.selection_noise_level,
+            )
+        ].copy()
+
+        validation_summary = summarize_candidates(validation_selection)
+
+        validation_ranked = add_selection_ranks(validation_summary)
         validation_ranked.to_csv(
             output_dir / "validation_candidate_summary.csv",
             index=False,
@@ -297,28 +337,27 @@ class SmoothingExperiment:
             "variable",
             "filter",
             "params",
+            "mean_input_rmse",
+            "mean_rmse",
             "mean_rmse_reduction_pct",
+            "mean_input_snr_db",
+            "mean_output_snr_db",
             "mean_snr_improvement_db",
-            "mean_stable_rmse_reduction_pct",
-            "mean_stable_roughness_ratio",
-            "mean_transition_rmse",
-            "eligible",
+            "improves_baseline",
         ]
 
-        print("\nValidation eligibility diagnostics:")
+        print("\nNominal-noise validation results:")
 
         print(
             validation_ranked[diagnostic_columns]
             .sort_values(
                 [
                     "variable",
-                    "eligible",
-                    "mean_snr_improvement_db",
+                    "mean_rmse",
                 ],
                 ascending=[
                     True,
-                    False,
-                    False,
+                    True,
                 ],
             )
             .to_string(index=False)
@@ -348,12 +387,12 @@ class SmoothingExperiment:
             "variable",
             "filter",
             "params",
+            "mean_input_rmse",
             "mean_rmse",
             "mean_rmse_reduction_pct",
+            "mean_input_snr_db",
+            "mean_output_snr_db",
             "mean_snr_improvement_db",
-            "mean_stable_rmse_reduction_pct",
-            "mean_stable_roughness_ratio",
-            "mean_transition_rmse",
             "recommended",
         ]
         print(best_per_variable[display_cols].to_string(index=False))

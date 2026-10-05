@@ -28,12 +28,40 @@ class ExperimentConfig:
     you can widen them for the final FYP experiment.
     """
 
-    # Clean-template extraction settings.
-    n_anchors: int = 41
-    anchor_half_window: int = 10
+    # ------------------------------------------------------------
+    # CLEAN REFERENCE
+    # ------------------------------------------------------------
+    #
+    # PCHIP itself does NOT prescribe an anchor interval.
+    # We define the reference in physical time instead of choosing
+    # a fixed number of anchors.
+    #
+    # Default = one robust reference point every 60 seconds.
+    #
+    # For the final experiment, run sensitivity analyses at
+    # 30, 60 and 120 seconds.
 
-    # Artificial-noise levels relative to the estimated real-data noise.
+    reference_anchor_spacing_seconds: float = 60.0
+
+    # ------------------------------------------------------------
+    # SYNTHETIC NOISE
+    # ------------------------------------------------------------
+
+    # 1.0 = noise magnitude estimated from the real-data residual.
+    #
+    # 0.5 and 2.0 are retained for robustness analysis but DO NOT
+    # determine the winning filter.
     noise_levels: List[float] = field(default_factory=lambda: [0.5, 1.0, 2.0])
+
+    # Filter selection is performed at the nominal estimated
+    # real-noise level.
+    selection_noise_level: float = 1.0
+
+    # Primary controlled benchmark:
+    # zero-mean Gaussian noise.
+    #
+    # Correlated noise can later be enabled as a robustness test.
+    use_correlated_noise: bool = False
 
     # Different random noise realizations used while tuning.
     tuning_seeds: List[int] = field(default_factory=lambda: list(range(5)))
@@ -41,10 +69,6 @@ class ExperimentConfig:
     # Different seeds reserved for final synthetic validation of the winners.
     validation_seeds: List[int] = field(default_factory=lambda: [100, 101, 102])
 
-    # Hyperparameter search spaces.
-    # EMA search space.
-    # Keep small spans because EMA may need to remain responsive,
-    # but the optimizer will now reject spans that do not actually denoise.
     ema_spans: List[int] = field(
         default_factory=lambda: [
             3,
@@ -55,13 +79,11 @@ class ExperimentConfig:
             31,
             45,
             61,
+            81,
+            101,
         ]
     )
 
-    # Avoid extremely small causal SG windows.
-    #
-    # A window such as 5 with polynomial order 3 can follow the noisy signal
-    # too closely, especially at the right edge of a causal SG filter.
     sg_windows: List[int] = field(
         default_factory=lambda: [
             11,
@@ -71,11 +93,10 @@ class ExperimentConfig:
             41,
             61,
             81,
+            101,
         ]
     )
 
-    # Polynomial orders 1 and 2 are sufficient for preserving local
-    # level/slope/curvature without making the filter excessively flexible.
     sg_polyorders: List[int] = field(
         default_factory=lambda: [
             1,
@@ -83,34 +104,44 @@ class ExperimentConfig:
         ]
     )
 
-    # Weighted SG should not excessively favour the newest measurement.
-    #
-    # 1.0 = equal weighting
-    # 0.8 = mild recent-sample emphasis
-    # 0.6 = moderate recent-sample emphasis
     wsg_oldest_weight_ratios: List[float] = field(
         default_factory=lambda: [
-            0.6,
-            0.8,
-            1.0,
+            0.5,
+            0.7,
+            0.9,
         ]
     )
 
-    # Kalman Q/R ratio. A logarithmic grid is appropriate because useful
-    # values often span orders of magnitude.
     kalman_q_over_r: List[float] = field(
-        default_factory=lambda: [1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1]
+        default_factory=lambda: [
+            1e-5,
+            3e-5,
+            1e-4,
+            3e-4,
+            1e-3,
+            3e-3,
+            1e-2,
+            3e-2,
+            1e-1,
+            3e-1,
+            1.0,
+        ]
     )
 
     # Optional noise effects. Keep spikes off initially for the primary clean
     # Gaussian/correlated-noise benchmark; enable later as a robustness test.
     add_spikes: bool = False
-    apply_quantization: bool = True
+
+    # Do not quantize the primary synthetic benchmark.
+    #
+    # Quantization can be investigated later as a separate
+    # robustness condition.
+    apply_quantization: bool = False
 
     # The first samples of large-window causal filters are a warm-up period.
     # We exclude the same fixed number of samples from every candidate so the
     # comparison is fair and no filter gains an advantage from its own window.
-    metric_warmup_samples: int = 61
+    metric_warmup_samples: int = 0
 
     # Plotting is part of the offline research workflow only. It does not affect
     # filter selection or the future real-time SCADA filtering implementation.
@@ -118,30 +149,20 @@ class ExperimentConfig:
     plot_dpi: int = 160
 
     # ------------------------------------------------------------
-    # FILTER ELIGIBILITY REQUIREMENTS
+    # REPORT / ILLUSTRATION CHUNKS
     # ------------------------------------------------------------
     #
-    # A configuration must first demonstrate that it actually denoises
-    # the signal before it is allowed to compete based on transition
-    # preservation.
-    #
-    # These are initial engineering thresholds and can later be reported
-    # as experiment design parameters.
+    # These settings affect figures ONLY.
+    # They do NOT participate in filter tuning or selection.
 
-    minimum_snr_improvement_db: float = 0.5
+    # Length of each zoomed reporting window.
+    report_chunk_seconds: float = 120.0
 
-    # Filtered RMSE must improve by at least 5% compared with the
-    # unfiltered artificial noisy signal.
-    minimum_rmse_reduction_pct: float = 5.0
+    # Candidate chunk positions are evaluated every 30 seconds.
+    # Smaller stride gives finer placement but does not affect
+    # the actual filtering experiment.
+    report_chunk_stride_seconds: float = 30.0
 
-    # In stable regions, where the true signal changes slowly, the filter
-    # should reduce error by at least 5%.
-    minimum_stable_rmse_reduction_pct: float = 5.0
-
-    # Roughness ratio:
-    #
-    #   filtered roughness / noisy roughness
-    #
-    # 1.0 = essentially no smoothing
-    # 0.85 = at least ~15% reduction in short-term roughness
-    maximum_stable_roughness_ratio: float = 0.85
+    # Number of predefined representative chunk types:
+    # stable, representative, transition.
+    report_chunk_count: int = 3

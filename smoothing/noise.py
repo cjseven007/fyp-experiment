@@ -111,44 +111,111 @@ def add_artificial_noise(
     level: float,
     seed: int,
     add_spikes: bool = False,
-    apply_quantization: bool = True,
+    apply_quantization: bool = False,
+    use_correlation: bool = False,
 ) -> np.ndarray:
-    """Create one reproducible noisy realization from a clean signal.
+    """Generate a reproducible artificial noisy signal.
 
-    The base noise is AR(1)-correlated Gaussian noise. If rho is near zero this
-    reduces to ordinary independent Gaussian noise.
+    Primary benchmark:
+        clean + Gaussian noise
+
+    Optional robustness tests:
+        - temporal correlation
+        - spikes
+        - sensor quantization
     """
 
-    clean = np.asarray(clean, dtype=float)
+    clean = np.asarray(
+        clean,
+        dtype=float,
+    )
+
     rng = np.random.default_rng(seed)
 
-    sigma = max(profile.sigma * level, 1e-12)
-    rho = float(np.clip(profile.rho, -0.8, 0.8))
+    sigma = max(
+        profile.sigma * level,
+        1e-12,
+    )
 
-    # Innovation variance chosen so stationary AR(1) noise has approximately
-    # the desired overall standard deviation sigma.
-    innovation_sigma = sigma * np.sqrt(max(1e-12, 1.0 - rho**2))
-    noise = np.zeros(len(clean), dtype=float)
+    # For the primary controlled experiment rho = 0.
+    #
+    # Correlated AR(1) noise can later be enabled as a
+    # robustness experiment.
+    rho = (
+        float(
+            np.clip(
+                profile.rho,
+                -0.8,
+                0.8,
+            )
+        )
+        if use_correlation
+        else 0.0
+    )
+
+    innovation_sigma = sigma * np.sqrt(
+        max(
+            1e-12,
+            1.0 - rho**2,
+        )
+    )
+
+    noise = np.zeros(
+        len(clean),
+        dtype=float,
+    )
+
     if len(noise) > 0:
-        noise[0] = rng.normal(0.0, sigma)
-    for i in range(1, len(noise)):
-        noise[i] = rho * noise[i - 1] + rng.normal(0.0, innovation_sigma)
+        noise[0] = rng.normal(
+            0.0,
+            sigma,
+        )
+
+    for i in range(
+        1,
+        len(noise),
+    ):
+
+        noise[i] = rho * noise[i - 1] + rng.normal(
+            0.0,
+            innovation_sigma,
+        )
 
     noisy = clean + noise
 
-    # Optional robustness scenario for occasional sensor spikes.
+    # -------------------------------------------------
+    # OPTIONAL SPIKES
+    # -------------------------------------------------
+
     if add_spikes and profile.spike_probability > 0:
+
         spike_mask = rng.random(len(clean)) < profile.spike_probability
-        directions = rng.choice([-1.0, 1.0], size=len(clean))
-        magnitudes = np.abs(
-            rng.normal(loc=profile.spike_scale, scale=0.25 * profile.spike_scale, size=len(clean))
+
+        directions = rng.choice(
+            [-1.0, 1.0],
+            size=len(clean),
         )
+
+        magnitudes = np.abs(
+            rng.normal(
+                loc=profile.spike_scale,
+                scale=(0.25 * profile.spike_scale),
+                size=len(clean),
+            )
+        )
+
         noisy = noisy + spike_mask * directions * magnitudes
 
-    # Simulate finite sensor resolution, e.g. 0.01 pH or 0.01 barg.
+    # -------------------------------------------------
+    # OPTIONAL SENSOR QUANTIZATION
+    # -------------------------------------------------
+
     if apply_quantization and profile.quantization_step is not None:
+
         step = profile.quantization_step
+
         if step > 0:
+
             noisy = np.round(noisy / step) * step
 
     return noisy

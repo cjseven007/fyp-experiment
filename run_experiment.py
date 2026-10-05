@@ -23,11 +23,18 @@ def main():
         action="store_true",
         help="Skip Matplotlib/Seaborn figure generation during quick debugging runs.",
     )
+    parser.add_argument(
+        "--anchor-spacing",
+        type=float,
+        default=60.0,
+        help=("PCHIP reference anchor spacing " "in seconds."),
+    )
     args = parser.parse_args()
 
     # All experiment settings/hyperparameter grids live in one configuration
     # object so the scientific protocol is easy to inspect and reproduce.
     config = ExperimentConfig()
+    config.reference_anchor_spacing_seconds = args.anchor_spacing
     config.create_plots = not args.no_plots
 
     experiment = SmoothingExperiment(config)

@@ -604,6 +604,498 @@ def plot_selected_filter_examples(
         _finish_figure(fig, plot_dir / filename, dpi)
 
 
+def _window_gradient_score(
+    clean: np.ndarray,
+    start: int,
+    end: int,
+) -> float:
+    """Return average absolute slope inside one candidate chunk."""
+
+    segment = np.asarray(
+        clean[start:end],
+        dtype=float,
+    )
+
+    if len(segment) < 2:
+        return 0.0
+
+    gradient = np.abs(np.gradient(segment))
+
+    return float(np.mean(gradient))
+
+
+def _ranges_overlap(
+    start_a: int,
+    end_a: int,
+    start_b: int,
+    end_b: int,
+) -> bool:
+    """Check whether two sample ranges overlap."""
+
+    return not (end_a <= start_b or end_b <= start_a)
+
+
+def _choose_report_chunks(
+    clean: np.ndarray,
+    sampling_seconds: float,
+    chunk_seconds: float = 120.0,
+    stride_seconds: float = 30.0,
+) -> list[dict]:
+    """Automatically select representative reporting chunks.
+
+    Selection depends ONLY on the clean-reference slope, not on filter
+    performance. This prevents visually cherry-picking regions where the
+    selected filter happens to look particularly good.
+
+    Three regions are selected:
+
+    stable
+        Window with lowest average absolute clean-reference gradient.
+
+    transition
+        Window with highest average absolute clean-reference gradient.
+
+    representative
+        Window whose gradient is closest to the median gradient of all
+        candidate windows.
+    """
+
+    clean = np.asarray(
+        clean,
+        dtype=float,
+    )
+
+    n = len(clean)
+
+    chunk_samples = max(
+        10,
+        int(round(chunk_seconds / sampling_seconds)),
+    )
+
+    stride_samples = max(
+        1,
+        int(round(stride_seconds / sampling_seconds)),
+    )
+
+    # If the complete signal is shorter than the requested
+    # reporting window, just show the complete signal.
+    if n <= chunk_samples:
+        return [
+            {
+                "name": "complete",
+                "start": 0,
+                "end": n,
+                "gradient_score": (
+                    _window_gradient_score(
+                        clean,
+                        0,
+                        n,
+                    )
+                ),
+            }
+        ]
+
+    candidates = []
+
+    for start in range(
+        0,
+        n - chunk_samples + 1,
+        stride_samples,
+    ):
+
+        end = start + chunk_samples
+
+        score = _window_gradient_score(
+            clean,
+            start,
+            end,
+        )
+
+        candidates.append(
+            {
+                "start": start,
+                "end": end,
+                "gradient_score": score,
+            }
+        )
+
+    if not candidates:
+        return []
+
+    scores = np.asarray(
+        [item["gradient_score"] for item in candidates],
+        dtype=float,
+    )
+
+    # ---------------------------------------------------------
+    # STABLE WINDOW
+    # ---------------------------------------------------------
+
+    stable_index = int(np.argmin(scores))
+
+    stable = candidates[stable_index].copy()
+
+    stable["name"] = "stable"
+
+    # ---------------------------------------------------------
+    # TRANSITION WINDOW
+    # ---------------------------------------------------------
+
+    # Check candidates from highest gradient downward and
+    # preferably avoid overlapping with the stable region.
+
+    transition = None
+
+    for index in np.argsort(scores)[::-1]:
+
+        candidate = candidates[int(index)]
+
+        if not _ranges_overlap(
+            stable["start"],
+            stable["end"],
+            candidate["start"],
+            candidate["end"],
+        ):
+
+            transition = candidate.copy()
+            break
+
+    # If the signal is too short to find a non-overlapping window,
+    # simply use the highest-gradient region.
+    if transition is None:
+
+        transition = candidates[int(np.argmax(scores))].copy()
+
+    transition["name"] = "transition"
+
+    # ---------------------------------------------------------
+    # REPRESENTATIVE / MEDIAN-DYNAMICS WINDOW
+    # ---------------------------------------------------------
+
+    median_score = float(np.median(scores))
+
+    distance_from_median = np.abs(scores - median_score)
+
+    representative = None
+
+    for index in np.argsort(distance_from_median):
+
+        candidate = candidates[int(index)]
+
+        overlaps_stable = _ranges_overlap(
+            stable["start"],
+            stable["end"],
+            candidate["start"],
+            candidate["end"],
+        )
+
+        overlaps_transition = _ranges_overlap(
+            transition["start"],
+            transition["end"],
+            candidate["start"],
+            candidate["end"],
+        )
+
+        if not overlaps_stable and not overlaps_transition:
+
+            representative = candidate.copy()
+            break
+
+    if representative is None:
+
+        representative = candidates[int(np.argmin(distance_from_median))].copy()
+
+    representative["name"] = "representative"
+
+    return [
+        stable,
+        representative,
+        transition,
+    ]
+
+
+def plot_selected_filter_chunks(
+    prepared: Iterable[dict],
+    best_per_variable: pd.DataFrame,
+    config: ExperimentConfig,
+    output_dir: str | Path,
+    dpi: int = 160,
+) -> None:
+    """Create zoomed reporting figures for the selected filter.
+
+    For each dataset and variable, three automatically chosen regions
+    are shown:
+
+        stable
+        representative
+        transition
+
+    Each figure contains:
+
+        1. artificial noisy vs smoothed
+        2. clean reference vs smoothed
+        3. all three signals together
+
+    Chunk selection is based ONLY on clean-reference slope, so plots
+    are not cherry-picked based on the filter output.
+    """
+
+    plot_dir = _prepare_output_dir(
+        output_dir,
+        "08_selected_filter_chunks",
+    )
+
+    # Use the same nominal noise condition used for filter selection.
+    example_noise_level = getattr(
+        config,
+        "selection_noise_level",
+        1.0,
+    )
+
+    # Use a held-out validation seed rather than a tuning seed.
+    example_seed = config.validation_seeds[0]
+
+    winner_lookup = {row["variable"]: row for _, row in best_per_variable.iterrows()}
+
+    for item in prepared:
+
+        variable = item["variable"]
+
+        if variable not in winner_lookup:
+            continue
+
+        winner = winner_lookup[variable]
+
+        params = json.loads(winner["params"])
+
+        # -----------------------------------------------------
+        # GENERATE THE SAME KIND OF SYNTHETIC INPUT USED IN
+        # VALIDATION
+        # -----------------------------------------------------
+
+        noisy = add_artificial_noise(
+            clean=item["clean"],
+            profile=item["noise_profile"],
+            level=example_noise_level,
+            seed=example_seed,
+            add_spikes=config.add_spikes,
+            apply_quantization=(config.apply_quantization),
+            use_correlation=getattr(
+                config,
+                "use_correlated_noise",
+                False,
+            ),
+        )
+
+        # -----------------------------------------------------
+        # IMPORTANT:
+        # FILTER THE COMPLETE SIGNAL FIRST
+        # -----------------------------------------------------
+        #
+        # We do NOT filter each chunk independently.
+        #
+        # Otherwise causal filters would lose their previous state and
+        # the illustration would not represent real operation.
+
+        selected_filter = build_filter(
+            winner["filter"],
+            params,
+        )
+
+        filtered = selected_filter.apply_array(noisy)
+
+        clean = np.asarray(
+            item["clean"],
+            dtype=float,
+        )
+
+        sampling_seconds = float(
+            item.get(
+                "sampling_seconds",
+                1.0,
+            )
+        )
+
+        chunks = _choose_report_chunks(
+            clean=clean,
+            sampling_seconds=(sampling_seconds),
+            chunk_seconds=(config.report_chunk_seconds),
+            stride_seconds=(config.report_chunk_stride_seconds),
+        )
+
+        cfg = VARIABLES[variable]
+
+        filter_label = FILTER_LABELS.get(
+            winner["filter"],
+            winner["filter"],
+        )
+
+        for chunk in chunks:
+
+            start = chunk["start"]
+            end = chunk["end"]
+            chunk_name = chunk["name"]
+
+            clean_chunk = clean[start:end]
+
+            noisy_chunk = noisy[start:end]
+
+            filtered_chunk = filtered[start:end]
+
+            # Display local elapsed time rather than global sample index.
+            local_time = np.arange(end - start) * sampling_seconds
+
+            # -------------------------------------------------
+            # ONE REPORT FIGURE WITH THREE COMPARISONS
+            # -------------------------------------------------
+
+            fig, axes = plt.subplots(
+                nrows=3,
+                ncols=1,
+                figsize=(11, 10),
+                sharex=True,
+            )
+
+            # ---------------------------------------------
+            # A. ARTIFICIAL NOISE VS FILTERED
+            # ---------------------------------------------
+
+            axes[0].plot(
+                local_time,
+                noisy_chunk,
+                linewidth=0.9,
+                alpha=0.65,
+                label="Artificial noisy signal",
+            )
+
+            axes[0].plot(
+                local_time,
+                filtered_chunk,
+                linewidth=1.7,
+                label=f"Smoothed ({filter_label})",
+            )
+
+            axes[0].set_title("Artificial noisy signal vs smoothed signal")
+
+            axes[0].set_ylabel(f"{cfg.name.capitalize()} " f"({cfg.unit})")
+
+            axes[0].legend()
+
+            # ---------------------------------------------
+            # B. CLEAN REFERENCE VS FILTERED
+            # ---------------------------------------------
+
+            axes[1].plot(
+                local_time,
+                clean_chunk,
+                linewidth=2.0,
+                label="Clean reference",
+            )
+
+            axes[1].plot(
+                local_time,
+                filtered_chunk,
+                linewidth=1.7,
+                label=f"Smoothed ({filter_label})",
+            )
+
+            axes[1].set_title("Clean reference vs smoothed signal")
+
+            axes[1].set_ylabel(f"{cfg.name.capitalize()} " f"({cfg.unit})")
+
+            axes[1].legend()
+
+            # ---------------------------------------------
+            # C. ALL THREE
+            # ---------------------------------------------
+
+            axes[2].plot(
+                local_time,
+                noisy_chunk,
+                linewidth=0.8,
+                alpha=0.5,
+                label="Artificial noisy signal",
+            )
+
+            axes[2].plot(
+                local_time,
+                clean_chunk,
+                linewidth=2.0,
+                label="Clean reference",
+            )
+
+            axes[2].plot(
+                local_time,
+                filtered_chunk,
+                linewidth=1.6,
+                label=f"Smoothed ({filter_label})",
+            )
+
+            axes[2].set_title("Clean, artificial noisy and smoothed signals")
+
+            axes[2].set_xlabel("Time within chunk (s)")
+
+            axes[2].set_ylabel(f"{cfg.name.capitalize()} " f"({cfg.unit})")
+
+            axes[2].legend()
+
+            # ---------------------------------------------
+            # FIGURE TITLE
+            # ---------------------------------------------
+
+            start_seconds = start * sampling_seconds
+
+            end_seconds = (end - 1) * sampling_seconds
+
+            recommendation = bool(
+                winner.get(
+                    "recommended",
+                    True,
+                )
+            )
+
+            status = (
+                "recommended"
+                if recommendation
+                else "best numerical candidate; " "did not beat baseline"
+            )
+
+            fig.suptitle(
+                f"{cfg.name.capitalize()} — "
+                f"{chunk_name.capitalize()} chunk\n"
+                f"{item['source_file']} | "
+                f"{start_seconds:.0f}–"
+                f"{end_seconds:.0f} s | "
+                f"{filter_label} | "
+                f"{params} | {status}",
+                fontsize=12,
+            )
+
+            filename = (
+                f"dataset{item['dataset_id']}_"
+                f"{variable}_"
+                f"{chunk_name}_"
+                f"{start}_{end}.png"
+            )
+
+            fig.tight_layout(
+                rect=[
+                    0,
+                    0,
+                    1,
+                    0.94,
+                ]
+            )
+
+            fig.savefig(
+                plot_dir / filename,
+                dpi=dpi,
+                bbox_inches="tight",
+            )
+
+            plt.close(fig)
+
+
 def create_all_plots(
     prepared: Iterable[dict],
     candidate_summary: pd.DataFrame,
@@ -648,6 +1140,13 @@ def create_all_plots(
         dpi=config.plot_dpi,
     )
     plot_selected_filter_examples(
+        prepared,
+        best_per_variable,
+        config,
+        output_dir,
+        dpi=config.plot_dpi,
+    )
+    plot_selected_filter_chunks(
         prepared,
         best_per_variable,
         config,
