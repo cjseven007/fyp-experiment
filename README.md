@@ -1,5 +1,11 @@
 # FYP Smoothing Filter Experiment
 
+## S005-informed pH benchmark
+
+For explicit synthetic truth, causal smoothing, slope-change detection and BOCPD,
+see [PH_BENCHMARK.md](PH_BENCHMARK.md). Run `python run_ph_benchmark.py --help`.
+This is a separate workflow from the estimated-reference experiment below.
+
 This prototype performs the complete offline smoothing-filter experiment for the
 CO2 absorption/desorption SCADA signals.
 
